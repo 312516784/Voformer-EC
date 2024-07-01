@@ -1,0 +1,46 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+import math
+import sys
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import pdist, squareform
+from fastdtw import fastdtw
+from sklearn.decomposition import PCA
+sys.path.append('../../../..')
+from glob import glob
+from multiprocessing import Queue
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+import time
+from sklearn import metrics
+from sklearn.metrics import pairwise_distances
+from sklearn.metrics import davies_bouldin_score, silhouette_score, calinski_harabasz_score
+from bayes_opt import BayesianOptimization
+from tensorflow.python.client import device_lib
+from joblib import Parallel, delayed
+
+# Calculagraph
+start_time = time.time()
+
+# Parameters
+train_index = '1'
+model_name = 'precipitation'
+batch_size = 15                 # Batch size of train input data
+epoch = 100                     # Train epochs
+process_num = 10                 # Experiments times
+initial_learning_rate = 0.01    # Initial learning rate
+decay_steps = 10000             # Decay steps
+decay_rate = 0.5                # Decay rate
+warmup_step = 10000            # Warm up steps
+warm_power = 0.1                # The rate at which the learning rate decreases
+save_step = 1                   # How many times to train to save
+training = True               # Whether to train or save the model
+
+pre_train_input = Queue(maxsize=batch_size * batch_size)  # Preprocess the data, extract features
+pre_train_input_batch = Queue(maxsize=batch_size)  # Integrate preprocessed data
+# Model structure
+pb_path = f'./{model_name}'
