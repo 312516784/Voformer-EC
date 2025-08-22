@@ -1,634 +1,742 @@
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-import math
-import sys
-import time
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader, Dataset, random_split
+from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import pdist, squareform
-from fastdtw import fastdtw
+from sklearn.metrics import r2_score
+import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-sys.path.append('../../../..')
-from glob import glob
-from multiprocessing import Queue
-import tensorflow as tf
-from tensorflow.keras import layers
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.metrics.pairwise import pairwise_distances
+import math
+import copy
+import os
+import gc
 import time
-from sklearn import metrics
-from sklearn.metrics import pairwise_distances
-from sklearn.metrics import davies_bouldin_score, silhouette_score, calinski_harabasz_score
-from bayes_opt import BayesianOptimization
-from tensorflow.python.client import device_lib
-from joblib import Parallel, delayed
 
-# Calculagraph
-start_time = time.time()
+# Define the Config class, including all configuration parameters
+class Config:
+    # Data Directory
+    data_dir = '.'
+    data_path = 'combined_precipitation_temperature_data.npy'
+    
+    # Voformer configuration Voformer-Extreme Clustering
+    train_voformer = False # Whether to train the Voformer model
+    load_voformer = True # Whether to load an existing Voformer model
+    voformer_model_path = 'best_voformer_ec_ablation.pth' # Voformer model save path
+    
+    # Clustering configuration
+    perform_clustering = True # Whether to perform clustering
+    clustering_results_path = 'clustering_results_ablation.npy' # Clustering result save path
+    extracted_features_path = 'extracted_features_ablation.npy' # Extracted feature save path
+    
+    #  Visualization
+    visualize_clusters = True       # Whether to visualize the clustering results
+    visualization_output_dir = 'visualizations'  # Visualization output directory
+    
+    # Voformer parameters
+    input_dim = 2
+    d_model = 256
+    n_heads = 8
+    num_layers = 6
+    d_ff = 1024
+    dropout = 0.2
+    batch_size_voformer = 64
+    num_epochs = 70
+    learning_rate = 1e-5
+    
+    neighborhood_radius = 5 # Clustering neighborhood radius
+    ex_neighborhood_radius = 0.2
+    DC_reference_distance = 0.04
+    Noise_filtering_threshold = 0.05
+    patience = 10
 
-# Parameters
-train_index = '1'
-model_name = 'precipitation'
-batch_size = 15                 # Batch size of train input data
-epoch = 100                     # Train epochs
-process_num = 10                 # Experiments times
-initial_learning_rate = 0.01    # Initial learning rate
-decay_steps = 10000             # Decay steps
-decay_rate = 0.5                # Decay rate
-warmup_step = 10000            # Warm up steps
-warm_power = 0.1                # The rate at which the learning rate decreases
-save_step = 1                   # How many times to train to save
-training = True               # Whether to train or save the model
-
-pre_train_input = Queue(maxsize=batch_size * batch_size)  # Preprocess the data, extract features
-pre_train_input_batch = Queue(maxsize=batch_size)  # Integrate preprocessed data
-# Model structure
-pb_path = f'./{model_name}'
+    #Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+configs = Config()
 
 # Extreme Clustering
-def Extreme_Clustreing(data, neighbuorhood_radius=0.2):
-    data = np.array(data)  # Convert the list to a NumPy array
+def extreme_clustering(features, neighborhood_radius=0.2):
+    # Handle both PyTorch tensors and NumPy arrays
+    if isinstance(features, np.ndarray):
+        data = features
+    else:  # Assume PyTorch tensor
+        data = features.detach().cpu().numpy()
+    
     number = data.shape[0]
     dim = data.shape[1]
-    dist1 = pdist(data,metric='euclidean') # Elements fastdtw distance
-    dist = squareform(dist1) # Euclidean distance symmetric matrix
-    c = np.ones((number, number), dtype=int)
-    b = dist
-    for cow in range(number):
-        c[cow] = np.argsort(b[cow]) # Original data each elements euclidean distance index
-        b[cow] = np.sort(dist[cow]) # Original data each dataset sequence sort
 
-    # Computting density
-    # Gaussian Kernel Density Estimation
-    position = np.round((number)*0.013) - 1
+    # Calculate the distance matrix
+    dist1 = pdist(data, metric='euclidean')
     dist = squareform(dist1)
-    sda = np.sort(dist,axis = 0)
-    cow = (int)(position%number)
-    column = (int)(position/number)
-    dc = sda[cow,column]
-    density = np.zeros((number))
-    # Gaussian kernel calculation
-    for i in range(number-1):
-        for j in range(i+1,number):
-            density[i] = density[i] + np.exp(-(dist[i,j]/dc)*(dist[i,j]/dc))
-            density[j] = density[j] + np.exp(-(dist[i,j]/dc)*(dist[i,j]/dc))
 
-    # Searching for extreme points
-    # Initialisation
-    extremePoint = np.zeros((number, dim + 1))
-    extremePoint_num = 0
-    state = np.zeros((number), dtype=int)
+    # Sorting distance and index
+    sorted_indices = np.argsort(dist, axis=1)
+    sorted_distances = np.sort(dist, axis=1)
+
+    # Calculate distance
+    position = int(round(number * configs.DC_reference_distance)) - 1
+    sda = np.sort(dist, axis=0)
+    dc = sda[position % number, position // number]
+
+    # Calculate density
+    density = np.zeros(number)
+    for i in range(number - 1):
+        for j in range(i + 1, number):
+            tmp = np.exp(-((dist[i, j] / dc) ** 2))
+            density[i] += tmp
+            density[j] += tmp
+
+    # Finding extreme points
+    extreme_points = []
+    state = np.zeros(number)
     for i in range(number):
-        if i > number/2:
-            break
         if state[i] == 0:
-            # Traverse all density, whether there is a point with a density greater than the current point and neighbuorhood_radiu.
             j = 1
-            while density[i] >= density[c[i, j]] and b[i, j] < neighbuorhood_radius:
-                if density[i] == density[c[i, j]]:
-                    state[c[i, j]] = 1
+            while j < number and density[i] >= density[sorted_indices[i, j]] and sorted_distances[i, j] < neighborhood_radius:
+                if density[i] == density[sorted_indices[i, j]]:
+                    state[sorted_indices[i, j]] = 1
                 j += 1
-                if j == number:
-                    break
-            if j == number:
-                j = number - 1
-            ## Dataset[i] >= Neighbuorhood_radius, then it's a extreme point
-            if b[i, j] >= neighbuorhood_radius:
-                extremePoint_num += 1
-                extremePoint[extremePoint_num - 1, 0:dim] = data[i, 0:dim]
-                extremePoint[extremePoint_num - 1, dim] = i
+            if j < number and sorted_distances[i, j] >= neighborhood_radius:
+                extreme_points.append(i)
 
-    # Assigning category
-    # Initialisation
-    clustering_result = np.zeros((number), dtype=int)
-    for i in range(extremePoint_num):
-        clustering_result[(int)(extremePoint[i][dim])] = i + 1
+    # Allocation Category
+    clustering_result = np.zeros(number, dtype=int) - 1
+    for idx, point in enumerate(extreme_points):
+        clustering_result[point] = idx + 1
         j = 1
-        # Traverse all dataset distance, search to assign extreme point to be a knot
-        while b[(int)(extremePoint[i][dim])][j] < neighbuorhood_radius:
-            # If the density of the current point equal to the most density that the data sequence where that point lies, then it's a knot
-            if density[(int)(extremePoint[i][dim])] == density[c[(int)(extremePoint[i][dim]), j]]:
-                clustering_result[c[(int)(extremePoint[i][dim]), j]] = i + 1
+        while j < number and sorted_distances[point, j] < neighborhood_radius:
+            if density[point] == density[sorted_indices[point, j]]:
+                clustering_result[sorted_indices[point, j]] = idx + 1
             j += 1
+
+    # Allocate the remaining points
     for i in range(number):
-        if clustering_result[i] == 0:
-            queue = np.zeros((number), dtype=int)
-            s = 0
-            queue[s] = i
+        if clustering_result[i] == -1:
+            queue = [i]
             while True:
+                current_point = queue[-1]
                 j = 0
-                # Verify whether the current point is the density maximum
-                while density[queue[s]] >= density[c[queue[s], j]]:
+                while j < number and density[current_point] >= density[sorted_indices[current_point, j]]:
                     j += 1
-                    if j == number:
-                        j = number - 1
-                        break
-                # Verify whether the current point is the cluster knot
-                if clustering_result[c[queue[s]][j]] == 0:
-                    s += 1
-                    queue[s] = c[queue[s - 1]][j]
+                if j >= number:
+                    break  # 防止j超出范围
+                if clustering_result[sorted_indices[current_point, j]] == -1:
+                    queue.append(sorted_indices[current_point, j])
                 else:
                     break
-                if s == number - 1:
-                    s = number - 2
+                if len(queue) >= number:
                     break
-            # Assign cluster point labels
-            for t in range(s + 1):
-                clustering_result[queue[t]] = clustering_result[c[queue[s]][j]]
+            if j < number:
+                label = clustering_result[sorted_indices[current_point, j]]
+                for point in queue:
+                    clustering_result[point] = label
 
-    # Detecting noises
-    # Initialisation
-    num = np.zeros((extremePoint_num))
-    for i in range(number):
-        num[clustering_result[i] - 1] += 1 # Recording each clustering group member amount
-    num_mean = np.mean(num)
-    # Detect noises, because its number is too rare, in statistics, such observations are generally included as invalid values
-    for i in range(extremePoint_num):
-        if num[i] < num_mean * 0.05:
-            for j in range(number):
-                if clustering_result[j] == i + 1:
-                    clustering_result[j] = -1 # Invalid values label '-1' e.g. noise
-    # Make the categories in the clustering results continuous values
-    sortNum = 0
-    sortNumMax = np.max(clustering_result)
+    # Remove noise points
+    unique_labels, counts = np.unique(clustering_result, return_counts=True)
+    mean_count = np.mean(counts[unique_labels != -1])
+    noise_labels = unique_labels[counts < mean_count * configs.Noise_filtering_threshold]
+    for label in noise_labels:
+        clustering_result[clustering_result == label] = -1
 
-    clustering = -np.ones((number), dtype=int)
-    for i in range(sortNumMax):
-        flag = 0
-        for j in range(number):
-            if clustering_result[j] == i + 1:
-                flag = 1
-                break
-        if flag == 1:
-            sortNum += 1
-            for j in range(number):
-                if clustering_result[j] == i + 1:
-                    clustering[j] = sortNum
-    clustering_result = clustering
+    # Renumber
+    unique_labels = np.unique(clustering_result)
+    label_map = {label: idx for idx, label in enumerate(unique_labels) if label != -1}
+    for old_label, new_label in label_map.items():
+        clustering_result[clustering_result == old_label] = new_label
+
     return clustering_result
 
-# Clustering result two-dimension picture display
-def Visualization(data, clusteringResult, isShowNoise=False):
-    number = data.shape[0]
-    color = ['#278EA5', '#21E6C1', '#FFBA5A', '#FF7657', '#C56868', '#6b76ff', '#ff0000', '#9e579d', '#f85f73'
-        , '#928a97', '#b6f7c1', '#0b409c', '#d22780', '#882042', '#071E3D']
-    lineForm = ['o', '+', '*', 'x']
-    if data.shape[1] > 2:
-        pca = PCA(n_components=2)
-        data = pca.fit_transform(data)
-    for i in range(np.max(clusteringResult)):
-        Together = []
-        flag = 0
-        for j in range(number):
-            if clusteringResult[j] == i + 1:
-                flag += 1
-                Together.append(data[j])
-        Together = np.array(Together)
-        colorNum = np.mod(i + 1, 15)
-        formNum = np.mod(i + 1, 4)
-        plt.scatter(Together[:, 0], Together[:, 1], 15, color[colorNum], lineForm[formNum])
-
-    plt.xlabel('attribute 1', fontsize=10)
-    plt.ylabel('attribute 2', fontsize=10)
-    plt.title('Extreme clustering')
-    if isShowNoise == True:
-        Together = []
-        flag = 0
-        for j in range(number):
-            if clusteringResult[j] == -1:
-                flag += 1
-                Together.append(data[j])
-        Together = np.array(Together, dtype=int)
-        if Together.shape[0] != 0:
-            plt.scatter(Together[:, 0], Together[:, 1], 15, 'k', '.')
-    plt.show()
+def compute_clustering_loss(features, alpha=1.0, beta=0.1):
+    """
+    结合特征分布和聚类结构的损失
+    """
+    batch_size, feature_dim = features.shape
+    
+    # 1. 特征紧凑性损失
+    feature_mean = features.mean(dim=0, keepdim=True)
+    compactness_loss = F.mse_loss(features, feature_mean.expand_as(features))
+    
+    # 2. 特征多样性损失（避免特征坍塌）
+    features_norm = F.normalize(features, dim=1)
+    similarity_matrix = torch.matmul(features_norm, features_norm.T)
+    diversity_loss = similarity_matrix.mean()
+    
+    # 3. 聚类结构损失
+    pairwise_distances = torch.cdist(features, features)
+    # 鼓励形成明显的聚类结构
+    structure_loss = -torch.var(pairwise_distances)
+    
+    total_loss = alpha * compactness_loss + beta * diversity_loss + 0.01 * structure_loss
+    return total_loss
 
 # Voformer
-class StuModel:
-    def __init__(self, nums=10000, training=True):
-        self.nums = nums
-        self.training = training
-        self.input_data = layers.Input(shape=[512], name='input_data')
-        self.input_position = layers.Input(shape=[512, 256], name='input_position', dtype=tf.float32)
-        self.label_em_ids = layers.Input(shape=[512], name='label_em_ids', dtype=tf.int64)
-        self.label_position = layers.Input(shape=[512, 256], name='label_position', dtype=tf.float32)
-        self.decoder_encoder_input = layers.Input(shape=[512, 256], name='decoder_encoder_input')
-        self.decoder_label = layers.Embedding(self.nums, 256, name='decoder_label')
-        model_output = self.a_model()
-        inputs = [self.input_data, self.input_position, self.label_em_ids, self.label_position]
-        outputs = [model_output]
-        self.model = tf.keras.Model(inputs=inputs, outputs=outputs)
-        self.model.summary()
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model).to(torch.float32)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                             (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)].to(x.device)
 
-    def a_model(self):
-        self.time_feature = layers.Embedding(max_index + 1, 256, name='time_feature')
-        encoder_input = self.time_feature(self.input_data)
-        encoder_input = layers.Add()([encoder_input, self.input_position])
-        encoder_input = layers.Dropout(0.1)(encoder_input)
-        encoder_result, encoder_result_all = self.tr_encoder(encoder_input)
-        encoder_result = layers.LayerNormalization(epsilon=1e-5)(encoder_result)
-        self.encoder_result = encoder_result
+class Volatilite(nn.Module):
+    def forward(self, x):
+        mean_x = torch.mean(x, dim=1, keepdim=True)
+        deviation = (mean_x - x) ** 2
+        mean_deviation = torch.mean(deviation, dim=1, keepdim=True)  # Shape: (batch_size, 1, ...)
+        volatility = torch.sqrt(mean_deviation)  # Shape: (batch_size, 1, ...)
+        scaled_x = x * volatility
+        return scaled_x
 
-        if not self.training:
-            decoder_encoder_input = self.decoder_encoder_input
+class ProbSparseAttention(nn.Module):
+    def __init__(self, scale=None, attention_dropout=0.1):
+        super(ProbSparseAttention, self).__init__()
+        self.scale = scale
+        self.dropout = nn.Dropout(attention_dropout)
+
+    def forward(self, queries, keys, values, mask):
+        B, L_Q, D = queries.shape
+        _, L_K, _ = keys.shape
+
+        # Calculate scores (QK^T / sqrt(d_k)) and apply top-k sparsity
+        scale = self.scale or 1.0 / (D ** 0.5)
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) * scale
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -float('inf'))
+
+        # Top-k selection (sparse attention focus)
+        U_part = L_K
+        top_k = max(1, int(U_part / 4))  # Use 25% sparsity
+        idx = torch.topk(scores, top_k, dim=-1)[1]  # Get top-k indices
+        mask_topk = torch.zeros_like(scores).scatter_(-1, idx, 1.0).bool()
+        sparse_scores = scores.masked_fill(~mask_topk, -float('inf'))
+
+        # Apply softmax, dropout, and compute attention outputs
+        attn = self.dropout(torch.softmax(sparse_scores, dim=-1))
+        outputs = torch.matmul(attn, values)
+
+        return outputs
+
+class InformerAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super(InformerAttention, self).__init__()
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.scale = 1.0 / (self.d_k ** 0.5)
+
+        self.qkv_projection = nn.Linear(d_model, d_model * 3)  # Query, key, value
+        self.out_projection = nn.Linear(d_model, d_model)
+
+        self.attention = ProbSparseAttention(scale=self.scale, attention_dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, mask=None):
+        B, L, D = x.shape  # Batch size, Sequence length, Feature dimension (d_model)
+
+        # Compute Q, K, V
+        qkv = self.qkv_projection(x).view(B, L, 3, self.n_heads, self.d_k)
+        queries, keys, values = qkv.unbind(dim=2)  # Split Q, K, V (B, L, H, Dk)
+
+        # Reshape for multi-head attention
+        queries = queries.permute(0, 3, 1, 2).contiguous().view(-1, L, self.d_k)
+        keys = keys.permute(0, 3, 1, 2).contiguous().view(-1, L, self.d_k)
+        values = values.permute(0, 3, 1, 2).contiguous().view(-1, L, self.d_k)
+
+        # Apply ProbSparseAttention
+        outputs = self.attention(queries, keys, values, mask)
+
+        # Reshape back to original dimensions
+        outputs = outputs.view(B, self.n_heads, L, self.d_k).permute(0, 2, 1, 3)
+        outputs = outputs.contiguous().view(B, L, -1)  # (B, L, d_model)
+
+        # Final projections with dropout and residual connection
+        outputs = self.dropout(self.out_projection(outputs))
+        outputs = self.norm(outputs + x)  # Residual connection ensures same shape (B, L, d_model)
+
+        return outputs
+
+class VoformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+        super(VoformerEncoderLayer, self).__init__()
+        self.self_attn = InformerAttention(d_model, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            Volatilite(),  # Volatilite Activation Function
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, src, src_mask=None):
+        src2 = self.norm1(src)
+        src2 = self.self_attn(src2, mask=src_mask)
+        src = src + self.dropout1(src2)
+
+        src2 = self.norm2(src)
+        src2 = self.ffn(src2)
+        src = src + src2
+        return src
+
+class VoformerEncoder(nn.Module):
+    def __init__(self, encoder_layer, num_layers):
+        super(VoformerEncoder, self).__init__()
+        self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(encoder_layer.norm1.normalized_shape)
+
+    def forward(self, src, src_mask=None):
+        for layer in self.layers:
+            src = layer(src, src_mask=src_mask)
+        return self.norm(src)
+
+class Voformer(nn.Module):
+    def __init__(self, input_dim, d_model, n_heads, num_layers, d_ff, dropout=0.1):
+        super(Voformer, self).__init__()
+        self.input_linear = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layer = VoformerEncoderLayer(d_model, n_heads, d_ff, dropout)
+        self.encoder = VoformerEncoder(encoder_layer, num_layers)
+        self.feature_projection = nn.Linear(configs.d_model, configs.d_model)
+        self.output_projection = nn.Linear(d_model, input_dim)
+
+    def forward(self, x):
+        x = self.input_linear(x)
+        x = self.pos_encoder(x)
+        x = self.encoder(x)
+        return x
+
+# Voformer Training
+# Training Voformer
+def train_voformer_ec(configs):
+    # Loading data
+    data = np.load(configs.data_path)
+
+    # Data preprocessing
+    num_samples, seq_length, num_features = data.shape
+    data_reshaped = data.reshape(num_samples, seq_length * num_features)
+    
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(data_reshaped)
+    
+    # Reshape data_scaled back to (2415, 276, 2)
+    data_scaled_3d = data_scaled.reshape(num_samples, seq_length, num_features)
+    X = torch.tensor(data_scaled_3d, dtype=torch.float32) # (2415, 276, 2)
+
+    # Creating a dataset and data loader
+    dataset = TensorDataset(X)
+    # Divide the training set, validation set and test set (for example, 70% training, 15% validation, 15% test)
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+    
+    # Create DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=configs.batch_size_voformer, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=configs.batch_size_voformer, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=configs.batch_size_voformer, shuffle=False)
+
+    # Initialize the model
+    model = Voformer(configs.input_dim, configs.d_model, configs.n_heads, configs.num_layers, configs.d_ff, configs.dropout)
+    model = model.to(configs.device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=configs.learning_rate)
+
+    # Training loop
+    best_val_loss = float('inf')
+    patience_counter = 0
+    model.train()
+                           
+    for epoch in range(configs.num_epochs):
+        epoch_loss = 0
+        for batch in train_loader:
+            batch_X = batch[0].to(configs.device)
+
+            optimizer.zero_grad()
+            features = model(batch_X)
+            
+            loss = compute_clustering_loss(features.mean(dim=1))
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        avg_train_loss = epoch_loss / len(train_loader)
+
+        # Verification
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch_X = batch[0].to(configs.device)
+                features = model(batch_X)
+                
+                loss = compute_clustering_loss(features.mean(dim=1))
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+
+        print(f'Epoch {epoch+1}/{configs.num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}')
+
+        # 早停判断
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # 保存最佳模型
+            torch.save(model.state_dict(), configs.voformer_model_path)
+            print("保存当前最佳Voformer模型")
         else:
-            decoder_encoder_input = self.encoder_result
+            patience_counter += 1
+            if patience_counter >= configs.patience:
+                print("早停触发，停止训练...")
+                break
 
-        decoder_input = self.decoder_label(self.label_em_ids)
-        decoder_input = layers.Add()([decoder_input, self.label_position])
-        decoder_input = layers.Dropout(0.1)(decoder_input)
-        decoder_result, decoder_result_all = self.tr_decoder(decoder_input, decoder_encoder_input)
-        decoder_result = layers.LayerNormalization(epsilon=1e-5)(decoder_result)
-        model_output = layers.Dense(units=self.nums, name='model_output')(decoder_result)
-        decoder_output = layers.Softmax(name='decoder_output')(model_output)
-        return decoder_output
+    print("Voformer model training completed and saved")
+    return model
 
-    def _prob_QK(self, Q, K):  # n_top: c*ln(L_q)
-        B, H, L_K, E = K.shape
-        _, _, L_Q, _ = Q.shape
-        K_expand = tf.tile(tf.expand_dims(K, -3), [1, 1, L_K, 1, 1])
-        index_sample = np.random.randint(1, L_Q)  # real U = U_part(factor*ln(L_k))*L_q
-        K_sample = K_expand[:, :, :, index_sample, :]
-        Q_K_sample = tf.matmul(Q, tf.transpose(K_sample, [0, 1, 3, 2]))
-        return Q_K_sample
+# Voformer-EC
+# Loading Voformer
+def load_voformer_model(configs):
+    model = Voformer(configs.input_dim, configs.d_model, configs.n_heads, configs.num_layers, configs.d_ff, configs.dropout)
+    model.load_state_dict(torch.load(configs.voformer_model_path, map_location=configs.device))
+    model = model.to(configs.device)
+    model.eval()
+    print("Voformer loaded")
+    return model
 
-    def _update_context(self, context_in, V, scores, index, L_Q, attn_mask):
-        B, H, L_V, D = V.shape
-        attn = tf.nn.softmax(scores, dim=-1)  # nn.Softmax(dim=-1)(scores)
-        context_in[np.arange(B)[:, None, None],
-        np.arange(H)[None, :, None],
-        index, :] = tf.matmul(attn, V).type_as(context_in)
-        return (context_in, None)
-
-    def tr_encoder(self, encoder_input,
-                   hidden_size=256,
-                   head_num=4,
-                   hidden_layer_num=26,
-                   intermediate_size=2048):
-        if hidden_size % head_num != 0:
-            raise ValueError(f'hidden_size:{hidden_size} num_attention_heads:{head_num}')
-        head_dim = int(hidden_size / head_num)
-        all_layer_outputs = []
-        for layer_idx in range(hidden_layer_num):
-            # encoder-Pro self-attention
-            residual = encoder_input
-            encoder_output = layers.LayerNormalization(epsilon=1e-5)(encoder_input)
-            query, key, value = self.compute_qkv(name=f'encoder_qkv_{layer_idx}', query=encoder_output,
-                                                 key=encoder_output, value=encoder_output, head_num=head_num,
-                                                 head_dim=head_dim)
-            self.factor = 5
-            L_K = key.shape[1]
-            L_Q = query.shape[1]
-            U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item()  # c*ln(L_k)
-            u = self.factor * np.ceil(np.log(L_Q)).astype('int').item()  # c*ln(L_q)
-            U_part = U_part if U_part < L_K else L_K
-            u = u if u < L_Q else L_Q
-            scores_top = self._prob_QK(query, key)
-            context = tf.cumsum(value, -2)
-            encoder_output = tf.matmul(scores_top, context)
-            encoder_output = tf.reshape(encoder_output, [-1, encoder_output.shape[1],
-                                                         encoder_output.shape[2] * encoder_output.shape[3]])
-            # scores = self.compute_score(query=query, key=key, head_dim=head_dim)
-            # encoder_attention_mask = tf.expand_dims(tf.expand_dims(encoder_mask, 1), 1)
-            # encoder_output = self.compute_attention_result(value=value, scores=scores, mask=encoder_attention_mask,
-            #                                                head_num=head_num, head_dim=head_dim)
-            encoder_output = layers.Dense(units=hidden_size, kernel_initializer='he_normal')(encoder_output)
-            encoder_output = layers.Dropout(0.1)(encoder_output)
-            encoder_output = layers.Add()([residual, encoder_output])
-            # encoder-feed-forward
-            residual = encoder_output
-            encoder_output = layers.LayerNormalization(epsilon=1e-5)(encoder_output)
-            encoder_output = layers.Dense(units=intermediate_size, kernel_initializer='he_normal')(encoder_output)
-            # encoder_output = layers.ReLU()(encoder_output)
-            encoder_output = self.volatilite(encoder_output)
-            encoder_output = layers.Dropout(0.1)(encoder_output)
-            encoder_output = layers.Dense(units=hidden_size, kernel_initializer='he_normal')(encoder_output)
-            encoder_output = layers.Add()([residual, encoder_output])
-            encoder_input = encoder_output
-            all_layer_outputs.append(encoder_output)
-        return all_layer_outputs[-1], all_layer_outputs
-
-    def tr_decoder(self, decoder_input,
-                   encoder_result,
-                   hidden_size=256,
-                   head_num=4,
-                   hidden_layer_num=26,
-                   intermediate_size=2048):
-        if hidden_size % head_num != 0:
-            raise ValueError(f'hidden_size:{hidden_size} num_attention_heads:{head_num}')
-        head_dim = int(hidden_size / head_num)
-        all_layer_outputs = []
-        for layer_idx in range(hidden_layer_num):
-            # decoder:self-attention
-            residual = decoder_input
-            decoder_output = layers.LayerNormalization(epsilon=1e-5)(decoder_input)
-            query, key, value = self.compute_qkv(name=f'decoder_qkv_{layer_idx}', query=decoder_output,
-                                                 key=decoder_output, value=decoder_output, head_num=head_num,
-                                                 head_dim=head_dim)
-            scores = self.compute_score(query=query, key=key, head_dim=head_dim)
-            # The essence of the mask is to reduce the weight of the associated unit to approximately 0 during the attention. 
-            # The encoder-mask mainly does not focus on non-existing units.
-            # Decoder-self-mask，not only paying no attention to the non-existing unit, but also not pay attention to the unit after it.
-            # Therefore, different mask information is configured for each unit.
-            decoder_output = self.compute_attention_result(value=value, scores=scores,
-                                                           head_num=head_num, head_dim=head_dim)
-            decoder_output = layers.Dense(units=hidden_size, kernel_initializer='he_normal')(decoder_output)
-            decoder_output = layers.Dropout(0.2)(decoder_output)
-            decoder_output = layers.Add()([residual, decoder_output])
-
-            # decoder:encoder-decoder attention
-            residual = decoder_output
-            decoder_output = layers.LayerNormalization(epsilon=1e-5)(decoder_input)
-            query, key, value = self.compute_qkv(name=f'encoder-decoder_qkv_{layer_idx}', query=decoder_output,
-                                                 key=encoder_result, value=encoder_result, head_num=head_num,
-                                                 head_dim=head_dim)
-            scores = self.compute_score(query=query, key=key, head_dim=head_dim)
-            decoder_output = self.compute_attention_result(value=value, scores=scores,
-                                                           head_num=head_num, head_dim=head_dim)
-            decoder_output = layers.Dense(units=hidden_size, kernel_initializer='he_normal')(decoder_output)
-            decoder_output = layers.Dropout(0.1)(decoder_output)
-            decoder_output = layers.Add()([residual, decoder_output])
-
-            # Fully connected layer
-            residual = decoder_output
-            decoder_output = layers.LayerNormalization(epsilon=1e-5)(decoder_input)
-            decoder_output = layers.Dense(units=intermediate_size, kernel_initializer='he_normal')(decoder_output)
-            # decoder_output = layers.ReLU()(decoder_output)
-            decoder_output = self.volatilite(decoder_output)
-            decoder_output = layers.Dropout(0.1)(decoder_output)
-            decoder_output = layers.Dense(units=hidden_size, kernel_initializer='he_normal')(decoder_output)
-            decoder_output = layers.Add()([residual, decoder_output])
-
-            decoder_input = decoder_output
-            all_layer_outputs.append(decoder_output)
-        return all_layer_outputs[-1], all_layer_outputs
-
-    def compute_qkv(self, name, query, key, value,
-                    head_num,
-                    head_dim):
-        query_layer = layers.Dense(units=head_num * head_dim, kernel_initializer='he_normal',
-                                   name=f'query_{name}')(query)
-        key_layer = layers.Dense(units=head_num * head_dim, kernel_initializer='he_normal', name=f'key_{name}')(
-            key)
-        value_layer = layers.Dense(units=head_num * head_dim, kernel_initializer='he_normal',
-                                   name=f'value_{name}')(value)
-        query_layer = layers.Reshape([-1, head_num, head_dim])(query_layer)
-        key_layer = layers.Reshape([-1, head_num, head_dim])(key_layer)
-        value_layer = layers.Reshape([-1, head_num, head_dim])(value_layer)
-        return query_layer, key_layer, value_layer
-
-    def compute_score(self, query, key, head_dim):
-        query = tf.transpose(query, [0, 2, 1, 3])  # [batch,head_num,time1,head_dim]
-        key = tf.transpose(key, [0, 2, 3, 1])  # [batch,head_num,head_dim,time2]
-        scores = tf.matmul(query, key)
-        scores = tf.multiply(scores, 1.0 / math.sqrt(float(head_dim)))  # [batch,head_num,time1,time2]
-        return scores
-
-    def compute_attention_result(self, value, scores, head_num, head_dim):
-        # When performing attention, only the current unit and weight of each unit are considered.
-        # The non-existing units are not considered to have values, and all loss needs to be masked for non-existent units.
-        scores = layers.Softmax()(scores)
-
-        value = tf.transpose(value, [0, 2, 1, 3])  # [batch,head_num,time2,head_dim]
-        attention_result = tf.matmul(scores, value)
-        attention_result = tf.transpose(attention_result, [0, 2, 1, 3])  # [batch,time1,head_num,head_dim]
-        attention_result = layers.Reshape([-1, head_num * head_dim])(
-            attention_result)  # [batch,time1,head_num*head_dim]
-        return attention_result
-
-    def get_angles(self, pos, i, d_model):
-        angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
-        return pos * angle_rates
-
-    def positional_encoding(self, position, d_model):
-        angle_rads = self.get_angles(np.arange(position)[:, np.newaxis],
-                                     np.arange(d_model)[np.newaxis, :],
-                                     d_model)
-        # Item 2i uses sin
-        sines = np.sin(angle_rads[:, 0::2])
-        # Item 2i+1 uses cos
-        cones = np.cos(angle_rads[:, 1::2])
-        pos_encoding = np.concatenate([sines, cones], axis=-1)
-        pos_encoding = pos_encoding[np.newaxis, ...]
-
-        return tf.cast(pos_encoding, dtype=tf.float32)
-
-    def gelu(self, x):
-        cdf = 0.5 * (1.0 + tf.tanh(
-            (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
-        return x * cdf
-
-    #def volatilite(self, x):
-    #    x = tf.square(tf.reduce_mean(x, axis=1, keepdims=True) - x)
-    #    x = tf.reduce_mean(x, axis=1)
-    #    x = tf.sqrt(x)
-    #    return x
+# Extract features by Voformer
+def extract_features_with_voformer_ec(data, model, configs):
+    """使用训练好的Voformer-EC模型提取特征并进行聚类"""
+    model.eval()
+    features_list = []
     
-    def volatilite(self, x, window_size=4):
-        # x has shape [batch, timesteps, features]
-        # Let's assume 'timesteps' axis is at index 1
-        batch_size, timesteps, num_features = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2]
+    # 数据预处理
+    num_samples, seq_length, num_features = data.shape
+    data_reshaped = data.reshape(num_samples, seq_length * num_features)
     
-        # Processing by slicing rather than reshaping
-        volatility_scores = []
-        
-        # Iterate through every possible window
-        for i in range(0, timesteps, window_size):
-            # Select the window, making sure it does not extend beyond the array boundaries
-            end = i + window_size
-            window = x[:, i:end, :]
-            
-            # Calculate the mean and standard deviation for each window
-            window_mean = tf.reduce_mean(window, axis=1, keepdims=True)
-            # Calculate volatility by scalar subtraction and squaring
-            window_volatility = tf.square(window - window_mean)
-            window_volatility = tf.sqrt(tf.reduce_mean(window_volatility, axis=1))  # axis=1 Keep feature dimensions unchanged
-            
-            volatility_scores.append(window_volatility)
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(data_reshaped)
+    data_scaled_3d = data_scaled.reshape(num_samples, seq_length, num_features)
+    X = torch.tensor(data_scaled_3d, dtype=torch.float32)
     
-        # Concatenate scores along the timesteps axis
-        volatility_scores = tf.concat(volatility_scores, axis=1)
+    # 创建数据加载器
+    dataset = TensorDataset(X)
+    dataloader = DataLoader(dataset, batch_size=configs.batch_size_voformer, shuffle=False)
+    
+    # 提取特征
+    with torch.no_grad():
+        for batch in dataloader:
+            batch_X = batch[0].to(configs.device)
+            batch_features = model(batch_X)
+            features_list.append(batch_features.cpu().numpy())
+    
+    # 合并所有特征
+    features = np.concatenate(features_list, axis=0)
+    
+    features_2d = features.mean(axis=1)
+    print(f"特征形状转换: {features.shape} -> {features_2d.shape}")
+    # 执行极值聚类
+    print("开始执行Extreme Clustering...")
+    clustering = extreme_clustering(features_2d, neighborhood_radius=configs.ex_neighborhood_radius)
+    
+    return features_2d, clustering
+
+def within_cluster_ss(X, labels, centroids):
+    """计算簇内平方和（惯性）"""
+    inertia = 0
+    for i in range(len(centroids)):
+        cluster_mask = labels == i
+        if np.sum(cluster_mask) > 0:  # 确保簇不为空
+            inertia += np.sum((X[cluster_mask] - centroids[i]) ** 2)
+    return inertia
+
+def mean_distance_to_nearest_cluster_member(X, labels):
+    """计算到最近簇成员的平均距离"""
+    unique_labels = np.unique(labels[labels != -1])  # 排除噪声点
+    mean_distances = []
+    
+    for label in unique_labels:
+        cluster_points = X[labels == label]
+        if len(cluster_points) > 1:
+            distances = pairwise_distances(cluster_points)
+            np.fill_diagonal(distances, np.inf)
+            min_distances = np.min(distances, axis=1)
+            mean_distances.append(np.mean(min_distances))
+    
+    return np.mean(mean_distances) if mean_distances else 0
+
+def dunn_index(X, labels, centroids):
+    """计算邓恩指数"""
+    unique_labels = np.unique(labels[labels != -1])  # 排除噪声点
+    num_clusters = len(unique_labels)
+    
+    if num_clusters < 2:
+        return 0
+    
+    inter_cluster_dists = pdist(centroids, 'euclidean')
+    inter_cluster_dists = squareform(inter_cluster_dists)
+    np.fill_diagonal(inter_cluster_dists, np.inf)
+    
+    min_inter_cluster_dist = np.min(inter_cluster_dists)
+    
+    max_intra_cluster_dist = 0
+    for i, label in enumerate(unique_labels):
+        cluster_points = X[labels == label]
         
-        #Finally flatten to ensure that the last dimension is the product of time steps and features, so that the shape is consistent
-        #Note the operation here, we assume that the modified shape is appropriate for subsequent layers (please adjust as needed)
-        volatility_scores = tf.reshape(volatility_scores, [batch_size, -1])
-        
-        return volatility_scores
-
-
-
-def compute_loss(input_data, model_output):
-    c_data = []
-    for data in input_data:
-        tmp_data = []
-        for d in data:
-            d_data = np.zeros(len(emb))
-            d_data[d] = 1
-            tmp_data.append(d_data)
-        c_data.append(tmp_data)
-    c_data = np.array(c_data)
-    return tf.reduce_mean(-tf.multiply(c_data, tf.keras.backend.log(model_output + 1e-7)) - tf.multiply(
-        (1 - c_data), tf.keras.backend.log(1 - model_output + 1e-7)))
-
-def position_embedding(position, d_model):
-    pos_encoding = np.zeros([position, d_model])
-    position = np.expand_dims(np.arange(0, position, dtype=np.float32), 1)
-    div_term = np.power(10000, -np.arange(0, d_model, 2, dtype=np.float32) / d_model)
-    pos_encoding[:, 0::2] = np.sin(position * div_term)
-    pos_encoding[:, 1::2] = np.cos(position * div_term)
-    return pos_encoding
-
-def chunks(arr_list, num):
-    n = int(math.ceil(len(arr_list) / float(num)))
-    return [arr_list[i:i + n] for i in range(0, len(arr_list), n)]
-
-def load_frame(path):
-    frame_names = {}
-    for frame_name in glob(f'{path}/frame*'):
-        name = os.path.split(frame_name)[1]
-        if len(name.split('_')) == 2:
-            frame_names[int(name.split('_')[1])] = frame_name
-
-    if len(sorted(frame_names)) == 0:
-        return None, None
-    else:
-        frame_index = sorted(frame_names)[-1]
-        return frame_names[frame_index], frame_index
-
-def delete_frame(path):
-    frame_names = {}
-    for frame_name in glob(f'{path}/frame*'):
-        name = os.path.split(frame_name)[1]
-        if len(name.split('_')) == 2:
-            frame_names[int(name.split('_')[1])] = frame_name
-
-    for delete_key in sorted(frame_names)[:-5]:
-        os.remove(frame_names[delete_key])
-
-# Voformer-EC training and clustering
-datas = []
-emb = []
-with open('Precipitation 20120608.txt', 'r') as f:
-    for line in f.readlines():
-        tmp_list = []
-        for l in line.split('\t')[1:]:
-            tmp_list.append(float(l))
-            emb.append(float(l))
-        datas.append(tmp_list)
-emb = list(set(emb))
-
-train_data = []
-for data in datas:
-    train_data.append([emb.index(d) for d in data])
-max_index = max([max(row) for row in train_data])
-
-''' ----------------------------Load Model------------------------------- '''
-if not os.path.exists(pb_path):
-    os.makedirs(pb_path)
-
-stu_train_model = None
-stu = StuModel(len(emb))
-# Restore weight
-frame_path, frame_index = load_frame(path=pb_path)
-if frame_path is None:
-    global_step = 0
-else:
-    stu.model.load_weights(frame_path, by_name=True, skip_mismatch=False)
-    global_step = frame_index
-    print(f'Restore Weight = {frame_path}')
-stu_train_model = stu.model
-
-if not training:
-    time_feature = stu_train_model.weights[0].numpy()
-    time_feature_result = []
-    for t_d in train_data:
-        time_feature_result.append([time_feature[t] for t in t_d])
-
-    embeddings = np.array(time_feature_result)
-
-    # Feature dimension n*m*z
-    embeddings_1=np.mean(embeddings,-2) # n*z
-    embeddings_2 =np.reshape(embeddings,[len(embeddings),-1]) # n*(m*z)  
-    # Perform clustering and visualization
-    cluster_result=Extreme_Clustreing(embeddings_2,4)
-    print(cluster_result)
-    result=np.unique(cluster_result).shape[0]
-    print("Number={}".format(result))
-    Visualization(embeddings_2, cluster_result, False)
-    cluster_result_df = pd.DataFrame(cluster_result, columns=['Cluster'])
-    cluster_result_df.to_csv('F:/Desktop/PhD/Progress/weather data/precipitation documents/test_Precipitation 201206 result.csv', index=False)
-    # End Timing
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Elapsed time: {elapsed_time:.4f} seconds")
-    sys.exit()
-
-
-''' ------------------------Processing Data------------------------------ '''
-position = position_embedding(1024, 256)
-
-lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=initial_learning_rate,
-                                                             decay_steps=decay_steps,
-                                                             decay_rate=decay_rate)
-optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-
-current_loss = 0
-
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, mode='min', verbose=1)
-
-best_model_checkpoint = ModelCheckpoint(filepath=f'{pb_path}/best_model.h5',
-                                        monitor='val_loss',
-                                        save_best_only=True,
-                                        mode='min',
-                                        verbose=1)
-
-min_loss = np.inf
-patience = 20
-counter = 0
-
-for e_data in chunks(train_data, int(len(train_data) / batch_size)):
-    start_time = time.time()
-    position_e = np.array([position_embedding(276, 256) for i in range(len(e_data))])
-    input_data = np.array(e_data)
-    # Gradient descent
-    with tf.GradientTape(persistent=False) as tape:
-        try:
-            model_output = stu_train_model(
-                [input_data, position_e, input_data, position_e],
-                training=training)
-
-        except Exception as e:
-            print(e)
+        if len(cluster_points) <= 1:
             continue
-        second_time = time.time()
-        total_loss = compute_loss(input_data, model_output)
-        third_time = time.time()
+        
+        intra_cluster_dists = pdist(cluster_points, 'euclidean')
+        max_dist = np.max(intra_cluster_dists) if len(intra_cluster_dists) > 0 else 0
+        
+        if max_dist > max_intra_cluster_dist:
+            max_intra_cluster_dist = max_dist
+    
+    if max_intra_cluster_dist == 0:
+        return float('inf')
+    
+    dunn = min_inter_cluster_dist / max_intra_cluster_dist
+    return dunn
 
-    grads = tape.gradient(target=total_loss, sources=stu_train_model.trainable_variables)
-    # Gradient clipping
-    # for i, grad in enumerate(grads):
-    #     grads[i] = tf.clip_by_norm(grad, clip_norm=3)
-    optimizer.apply_gradients(zip(grads, stu_train_model.trainable_variables))
-    global_step = global_step + 1
-    print(f'Current{global_step}的total_loss = {total_loss} ')
-    fourth_time = time.time()
+def calculate_centroids(X, labels):
+    """计算每个簇的中心点"""
+    unique_labels = np.unique(labels[labels != -1])  # 排除噪声点
+    centroids = []
+    
+    for label in unique_labels:
+        cluster_points = X[labels == label]
+        centroid = np.mean(cluster_points, axis=0)
+        centroids.append(centroid)
+    
+    return np.array(centroids)
 
-    if total_loss < min_loss:
-        min_loss = total_loss
-        counter = 0
+def evaluate_clustering(features, labels):
+    """评估聚类结果"""
+    # 过滤噪声点
+    valid_indices = labels != -1
+    if np.sum(valid_indices) < 2:
+        print("警告：有效聚类点数量不足，无法计算评估指标")
+        return {}
+    
+    valid_features = features[valid_indices]
+    valid_labels = labels[valid_indices]
+    
+    # 检查聚类数量
+    n_clusters = len(np.unique(valid_labels))
+    if n_clusters < 2:
+        print("警告：聚类数量不足，无法计算评估指标")
+        return {}
+    
+    try:
+        # 计算质心
+        centroids = calculate_centroids(features, labels)
+        
+        # 计算传统聚类评估指标
+        silhouette = silhouette_score(valid_features, valid_labels)
+        davies_bouldin = davies_bouldin_score(valid_features, valid_labels)
+        calinski_harabasz = calinski_harabasz_score(valid_features, valid_labels)
+        
+        # 计算新增的三个指标
+        inertia = within_cluster_ss(features, labels, centroids)
+        mean_nearest_distance = mean_distance_to_nearest_cluster_member(features, labels)
+        dunn = dunn_index(features, labels, centroids)
+        
+        metrics = {
+            'silhouette_score': silhouette,
+            'davies_bouldin_score': davies_bouldin,
+            'calinski_harabasz_score': calinski_harabasz,
+            'within_cluster_ss': inertia,
+            'mean_nearest_distance': mean_nearest_distance,
+            'dunn_index': dunn,
+            'n_clusters': n_clusters,
+            'n_noise_points': np.sum(labels == -1),
+            'n_valid_points': np.sum(valid_indices)
+        }
+        
+        print(f"聚类评估结果:")
+        print(f"  轮廓系数 (Silhouette Score): {silhouette:.4f}")
+        print(f"  Davies-Bouldin指数: {davies_bouldin:.4f}")
+        print(f"  Calinski-Harabasz指数: {calinski_harabasz:.4f}")
+        print(f"  簇内平方和 (Within-cluster SS): {inertia:.4f}")
+        print(f"  最近簇成员平均距离: {mean_nearest_distance:.4f}")
+        print(f"  邓恩指数 (Dunn Index): {dunn:.4f}")
+        print(f"  聚类数量: {n_clusters}")
+        print(f"  噪声点数量: {np.sum(labels == -1)}")
+        print(f"  有效点数量: {np.sum(valid_indices)}")
+        
+        return metrics
+    except Exception as e:
+        print(f"计算聚类评估指标时出错: {e}")
+        return {}
+
+# Voformer-EC visualization
+def visualize_clustering_results(features, labels, configs, save_path=None):
+    """可视化聚类结果"""
+    # 确保输出目录存在
+    if save_path is None:
+        os.makedirs(configs.visualization_output_dir, exist_ok=True)
+        save_path = os.path.join(configs.visualization_output_dir, 'clustering_results.png')
+    
+    # 使用PCA进行降维以便可视化
+    if features.shape[1] > 2:
+        pca = PCA(n_components=2)
+        features_2d = pca.fit_transform(features)
+        print(f"PCA降维完成，解释方差比: {pca.explained_variance_ratio_}")
     else:
-        counter += 1
+        features_2d = features
+    
+    # 创建图形
+    plt.figure(figsize=(12, 8))
+    
+    # 获取唯一标签
+    unique_labels = np.unique(labels)
+    colors = plt.cm.Set3(np.linspace(0, 1, len(unique_labels)))
+    
+    # 绘制每个聚类
+    for i, label in enumerate(unique_labels):
+        if label == -1:
+            # 噪声点用黑色表示
+            mask = labels == label
+            plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                       c='black', marker='x', s=50, alpha=0.6, label=f'Noise')
+        else:
+            mask = labels == label
+            plt.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                       c=[colors[i]], s=50, alpha=0.7, label=f'Cluster {label}')
+    
+    plt.title('Voformer-EC Result', fontsize=16)
+    plt.xlabel('Feature 1' if features.shape[1] > 2 else 'First principal component', fontsize=12)
+    plt.ylabel('Feature 2' if features.shape[1] > 2 else 'Second principal component', fontsize=12)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # 保存图形
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"聚类可视化结果已保存到: {save_path}")
 
-    if counter >= patience:
-        print("Early stopping triggered")
-        break
+def plot_training_history(train_losses, val_losses, save_path=None):
+    """绘制训练历史"""
+    plt.figure(figsize=(10, 6))
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+    plt.plot(epochs, val_losses, 'r-', label='Val Loss', linewidth=2)
+    
+    plt.title('Voformer-EC Training Track', fontsize=16)
+    plt.xlabel('Train count', fontsize=12)
+    plt.ylabel('Loss value', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
 
-    if global_step % save_step == 0:
-        stu_train_model.save(f'{pb_path}/frame_{global_step}', save_format='h5')
-        delete_frame(pb_path)
-        print(f'Save the model to{pb_path}')
+def perform_clustering_with_voformer_ec(model, data, configs):
+    """执行完整的聚类流程"""
+    print("开始提取特征并执行聚类...")
+    
+    # 提取特征和执行聚类
+    features, clustering_results = extract_features_with_voformer_ec(data, model, configs)
+    
+    # 保存结果
+    np.save(configs.extracted_features_path, features)
+    np.save(configs.clustering_results_path, clustering_results)
+    print(f"特征已保存到: {configs.extracted_features_path}")
+    print(f"聚类结果已保存到: {configs.clustering_results_path}")
+    
+    # 评估聚类结果
+    metrics = evaluate_clustering(features, clustering_results)
+    
+    # 可视化结果
+    if configs.visualize_clusters:
+        visualize_clustering_results(features, clustering_results, configs)
+    
+    return clustering_results, metrics
 
-stu_train_model.save(f'{pb_path}/frame_{global_step}', save_format='h5')
-delete_frame(pb_path)
-print(f'Save the model and the training is complete!')
-sys.exit()
+def save_results_summary(configs, metrics, clustering_results):
+    """保存结果摘要"""
+    summary = {
+        'model_config': {
+            'input_dim': configs.input_dim,
+            'd_model': configs.d_model,
+            'n_heads': configs.n_heads,
+            'num_layers': configs.num_layers,
+            'neighborhood_radius': configs.ex_neighborhood_radius,
+            'DC_reference_distance': configs.DC_reference_distance,
+            'Noise_filtering_threshold': configs.Noise_filtering_threshold
+        },
+        'clustering_metrics': metrics,
+        'clustering_summary': {
+            'total_points': len(clustering_results),
+            'unique_clusters': len(np.unique(clustering_results[clustering_results != -1])),
+            'noise_points': np.sum(clustering_results == -1)
+        }
+    }
+
+def main():
+    """主函数"""
+    configs = Config()
+    
+    print("=== Voformer-EC 纯聚类模型 ===")
+    print(f"设备: {configs.device}")
+    print(f"数据路径: {configs.data_path}")
+    
+    # 加载数据
+    if not os.path.exists(configs.data_path):
+        print(f"错误: 数据文件 {configs.data_path} 不存在!")
+        return
+    
+    print("加载数据...")
+    data = np.load(configs.data_path)
+    print(f"数据形状: {data.shape}")
+    
+    # 训练或加载Voformer-EC模型
+    if configs.train_voformer:
+        print("开始训练Voformer-EC模型...")
+        voformer_model = train_voformer_ec(configs)
+    else:
+        if os.path.exists(configs.voformer_model_path):
+            print("加载预训练的Voformer-EC模型...")
+            voformer_model = load_voformer_model(configs)
+        else:
+            print(f"模型文件 {configs.voformer_model_path} 不存在，开始训练...")
+            voformer_model = train_voformer_ec(configs)
+    
+    # 执行聚类
+    if configs.perform_clustering:
+        print("\n=== 开始聚类分析 ===")
+        clustering_results, metrics = perform_clustering_with_voformer_ec(voformer_model, data, configs)
+        
+        # 保存结果摘要
+        save_results_summary(configs, metrics, clustering_results)
+        
+        print("\n=== 聚类分析完成 ===")
+        print("所有结果文件已保存完成!")
+    
+    # 清理GPU内存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    print("程序执行完成!")
+
+if __name__ == "__main__":
+    main()
