@@ -1,6 +1,5 @@
 # Voformer-EC
-<img width="4267" height="1646" alt="voformer" src="https://github.com/user-attachments/assets/19c72b17-98f6-4fd1-8ea6-d0af11840ee0" />
-
+<img width="4267" height="1646" alt="graphic abstract" src="https://github.com/user-attachments/assets/4bdd19a9-7fb4-45e8-8d7a-a76a387df388" />
 Official implementation of **Voformer-EC: A Deep Clustering Framework with Statistical Physical Priors for Multivariate Time Series**.
 
 Voformer-EC is a deep clustering framework for **multivariate climate time series (MTS)**, designed to identify drought-relevant regimes from **unlabeled meteorological sequences**. The method combines:
