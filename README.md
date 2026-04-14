@@ -1,5 +1,5 @@
 # Voformer-EC
-![Final_Draft_25_May,2024_Untrack](https://github.com/312516784/Voformer-EC/assets/66837087/dd869737-38e1-4d3a-80d2-fe33f9a55087)
+[voformer.pdf](https://github.com/user-attachments/files/26722307/voformer.pdf)
 
 Official implementation of **Voformer-EC: A Deep Clustering Framework with Statistical Physical Priors for Multivariate Time Series**.
 
