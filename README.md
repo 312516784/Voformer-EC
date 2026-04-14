@@ -1,5 +1,5 @@
 # Voformer-EC
-[voformer.pdf](https://github.com/user-attachments/files/26722307/voformer.pdf)
+<img width="4267" height="1646" alt="voformer" src="https://github.com/user-attachments/assets/19c72b17-98f6-4fd1-8ea6-d0af11840ee0" />
 
 Official implementation of **Voformer-EC: A Deep Clustering Framework with Statistical Physical Priors for Multivariate Time Series**.
 
